@@ -18,19 +18,23 @@ use uuid::Uuid;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Set up input and output.
-    let token = env::var("KITTYCAD_API_TOKEN").context("You must set $KITTYCAD_API_TOKEN")?;
-    let img_output_path = env::var("IMAGE_OUTPUT_PATH").unwrap_or_else(|_| "model.png".to_owned());
-    let client = kittycad::Client::new(token);
+    // Set up the API client.
+    let kittycad_api_token =
+        env::var("KITTYCAD_API_TOKEN").context("You must set $KITTYCAD_API_TOKEN")?;
+    let kittycad_api_client = kittycad::Client::new(kittycad_api_token);
 
-    // Connect to KittyCAD modeling API via WebSocket.
-    let ws = client
+    // Where should the final PNG be saved?
+    let img_output_path = env::var("IMAGE_OUTPUT_PATH").unwrap_or_else(|_| "model.png".to_owned());
+
+    // Establish a WebSocket connection to KittyCAD's modeling API.
+    let ws = kittycad_api_client
         .modeling()
         .commands_ws(Some(30), Some(false), Some(480), Some(640), Some(false))
         .await
         .context("Could not open WebSocket to KittyCAD Modeling API")?;
 
-    // Prepare to write to/read from the WebSocket.
+    // Now that we have a WebSocket connection, we can split it into two ends:
+    // one for writing to and one for reading from.
     let (write, read) = tokio_tungstenite::WebSocketStream::from_raw_socket(
         ws,
         tokio_tungstenite::tungstenite::protocol::Role::Client,
@@ -39,9 +43,10 @@ async fn main() -> Result<()> {
     .await
     .split();
 
+    // First, send all commands to the API, to draw a cube.
+    // Then, read all responses from the API, to download the cube as a PNG.
     draw_cube(write, 10.0).await?;
-    export_png(read, img_output_path).await?;
-    Ok(())
+    export_png(read, img_output_path).await
 }
 
 /// Send modeling commands to the KittyCAD API.
@@ -52,28 +57,30 @@ async fn draw_cube(
 ) -> Result<()> {
     // All messages to the KittyCAD Modeling API will be sent over the WebSocket as Text.
     // The text will contain JSON representing a `ModelingCmdReq`.
-    let to_msg = |cmd, cmd_id| {
+    // This takes in a command and its ID, and makes a WebSocket message containing that command.
+    fn to_msg(cmd: ModelingCmd, cmd_id: Uuid) -> WsMsg {
         WsMsg::Text(
             serde_json::to_string(&WebSocketRequest::ModelingCmdReq { cmd, cmd_id }).unwrap(),
         )
-    };
+    }
 
     // Now the WebSocket is set up and ready to use!
     // We can start sending commands.
 
-    // Start a path
+    // Create a new empty path.
     let path_id = Uuid::new_v4();
     write_to_ws
         .send(to_msg(ModelingCmd::StartPath {}, path_id))
         .await?;
 
-    // Draw the path in a square shape.
+    // Add four lines to the path,
+    // in the shape of a square.
+    // First, start the path at the first corner.
     let start = Point3D {
         x: -width,
         y: -width,
         z: -width,
     };
-
     write_to_ws
         .send(to_msg(
             ModelingCmd::MovePathPen {
@@ -84,6 +91,7 @@ async fn draw_cube(
         ))
         .await?;
 
+    // Now extend the path to each corner, and back to the start.
     let points = [
         Point3D {
             x: width,
@@ -131,6 +139,8 @@ async fn draw_cube(
             Uuid::new_v4(),
         ))
         .await?;
+
+    // Export the model as a PNG.
     write_to_ws
         .send(to_msg(
             ModelingCmd::TakeSnapshot {
