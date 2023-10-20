@@ -44,6 +44,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Send modeling commands to the KittyCAD API.
+/// We're going to draw a cube and export it as a PNG.
 async fn draw_cube(
     mut write_to_ws: SplitSink<WebSocketStream<Upgraded>, WsMsg>,
     width: f64,
@@ -143,57 +145,65 @@ async fn draw_cube(
     Ok(())
 }
 
+/// Read WebSocket messages until we receive the PNG from the API.
+/// Then save it to the local filesystem.
 async fn export_png(
     mut read_from_ws: SplitStream<WebSocketStream<Upgraded>>,
     img_output_path: String,
 ) -> Result<()> {
-    fn ws_resp_from_text(text: &str) -> Result<OkWebSocketResponseData> {
+    /// Given the text from a WebSocket, deserialize its JSON.
+    /// Returns OK if the WebSocket's JSON represents a successful response.
+    /// Returns an error if the WebSocket's JSON represented a failure response.
+    fn decode_websocket_text(
+        text: &str,
+    ) -> Result<std::result::Result<OkWebSocketResponseData, FailureWebSocketResponse>> {
         let resp: WebSocketResponse = serde_json::from_str(text)?;
         match resp {
             WebSocketResponse::Success(s) => {
                 assert!(s.success);
-                Ok(s.resp)
+                Ok(Ok(s.resp))
             }
-            WebSocketResponse::Failure(mut f) => {
+            WebSocketResponse::Failure(f) => {
                 assert!(!f.success);
-                let Some(err) = f.errors.pop() else {
-                    bail!("websocket failure, no error given");
-                };
-                bail!("websocket failure: {err}");
+                Ok(Err(f))
             }
         }
     }
 
-    fn text_from_ws(msg: WsMsg) -> Result<Option<String>> {
+    /// Find the text in a WebSocket message, if there's any.
+    fn text_from_ws(msg: WsMsg) -> Option<String> {
         match msg {
-            // We expect all responses to be text.
-            WsMsg::Text(text) => Ok(Some(text)),
-            // WebSockets might sometimes send Pongs, that's OK. It's just for healthchecks or to
-            // keep the WebSocket open. We can ignore them.
-            WsMsg::Pong(_) => Ok(None),
-            other => bail!("only expected text or pong responses, but received {other:?}"),
+            WsMsg::Text(text) => Some(text),
+            _ => None,
         }
     }
 
     // Get Websocket messages from API server
     let server_responses = async move {
         while let Some(msg) = read_from_ws.next().await {
-            let Some(resp) = text_from_ws(msg?)? else {
+            // We're looking for a WebSocket response with text.
+            // Ignore any other type of WebSocket messages.
+            let Some(resp) = text_from_ws(msg?) else {
                 continue;
             };
-            let resp = ws_resp_from_text(&resp)?;
-            if let OkWebSocketResponseData::Modeling { modeling_response } = resp {
-                match modeling_response {
-                    OkModelingCmdResponse::Empty {} => {}
-                    OkModelingCmdResponse::TakeSnapshot { data } => {
-                        let mut img = image::io::Reader::new(Cursor::new(data.contents));
-                        img.set_format(image::ImageFormat::Png);
-                        let img = img.decode()?;
-                        img.save(img_output_path)?;
-                        break;
+            // What did the WebSocket response contain?
+            // It should either match the KittyCAD successful response schema, or the failed response schema.
+            match decode_websocket_text(&resp)? {
+                // Success!
+                Ok(OkWebSocketResponseData::Modeling { modeling_response }) => {
+                    match modeling_response {
+                        OkModelingCmdResponse::Empty {} => {}
+                        OkModelingCmdResponse::TakeSnapshot { data } => {
+                            save_image(data.contents.into(), &img_output_path)?;
+                            break;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                // Success, but not a modeling response
+                Ok(_) => {}
+                // Failure
+                Err(failure) => bail!("KittyCAD API responded with an error: {failure:?}"),
             }
         }
         Ok::<_, Error>(())
@@ -202,6 +212,15 @@ async fn export_png(
     Ok(())
 }
 
+fn save_image(contents: Vec<u8>, output_path: &str) -> Result<()> {
+    let mut img = image::io::Reader::new(Cursor::new(contents));
+    img.set_format(image::ImageFormat::Png);
+    let img = img.decode()?;
+    img.save(output_path)?;
+    Ok(())
+}
+
+/// The WebSocket responses coming from the server.
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum WebSocketResponse {
